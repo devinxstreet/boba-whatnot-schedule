@@ -25,25 +25,21 @@ async function autoScroll(page, { step=700, pause=220, max=12000 }={}){
 
 /** Extract cards from the user's shows page */
 async function extractFromShows(page){
-  // Wait a beat for dynamic lists to render
   await page.waitForTimeout(2000);
   await dismissOverlays(page);
   await autoScroll(page);
 
   const items = await page.evaluate(() => {
-    // any link to a live show detail page
     const links = Array.from(document.querySelectorAll('a[href*="/live/"]'));
     const out = links.map(a => {
       const href = a.getAttribute('href');
       const url = href ? new URL(href, location.origin).href : null;
 
-      // Try to get visible title on the card
       const title =
         a.getAttribute('aria-label')?.trim() ||
         a.querySelector('h1,h2,h3')?.textContent?.trim() ||
         a.textContent.trim() || '';
 
-      // nearest container for meta
       const card = a.closest('article, [data-test*="card"], [data-testid*="card"], section, div');
 
       // time if present on card
@@ -67,12 +63,12 @@ async function extractFromShows(page){
     return out.filter(i => !seen.has(i.url) && seen.add(i.url));
   });
 
-  // Normalize time
+  // Normalize time (may still be null; we enrich later)
   return items.map(s => ({ ...s, start: s.startISO ? Date.parse(s.startISO) : null }));
 }
 
-/** Enrich each show by opening its page to get clean title/thumbnail/time via meta tags */
-async function enrich(browser, items, max=50){
+/** Open each show page and pull title/thumb/start time (super-robust extraction) */
+async function enrich(browser, items, max = 80) {
   const ctx = await browser.newContext({
     viewport: { width: 1366, height: 900 },
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117 Safari/537.36',
@@ -82,13 +78,13 @@ async function enrich(browser, items, max=50){
 
   // Anti-bot evasions
   await ctx.addInitScript(() => {
-    try{
-      Object.defineProperty(navigator,'webdriver',{ get: () => false });
-      Object.defineProperty(navigator,'languages',{ get: () => ['en-US','en'] });
-      Object.defineProperty(navigator,'plugins',{ get: () => [1,2,3] });
-      window.chrome = window.chrome || { runtime:{} };
+    try {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+      Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
+      window.chrome = window.chrome || { runtime: {} };
       const orig = navigator.permissions?.query;
-      if (orig){
+      if (orig) {
         navigator.permissions.query = (p) => (p && p.name === 'notifications'
           ? Promise.resolve({ state: Notification.permission })
           : orig(p));
@@ -100,53 +96,96 @@ async function enrich(browser, items, max=50){
         return gp.call(this, param);
       };
       Object.defineProperty(screen, 'availTop', { get: () => 0 });
-    }catch(e){}
+    } catch(e){}
   });
 
   const page = await ctx.newPage();
   const out = [];
 
-  for (let i=0; i<items.length && i<max; i++){
+  for (let i = 0; i < items.length && i < max; i++) {
     const it = items[i];
-    try{
+    try {
       await page.goto(it.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await page.waitForTimeout(1200);
+      await page.waitForTimeout(1400);
 
       const meta = await page.evaluate(() => {
         const pick = (sel) => document.querySelector(sel)?.getAttribute('content') || null;
+
+        // 1) standard metas / visible h1
         const ogTitle = pick('meta[property="og:title"]') || pick('meta[name="og:title"]') || pick('meta[name="twitter:title"]');
         const ogImg   = pick('meta[property="og:image"]') || pick('meta[name="og:image"]') || pick('meta[name="twitter:image"]');
         const pageH1  = document.querySelector('h1')?.textContent?.trim() || null;
 
-        // multi-strategy start time
+        // 2) obvious DOM attributes for start time
         let startISO =
           document.querySelector('time[datetime]')?.getAttribute('datetime') ||
           document.querySelector('[data-start-time]')?.getAttribute('data-start-time') ||
           document.querySelector('meta[itemprop="startDate"]')?.getAttribute('content') ||
           null;
 
-        if (!startISO){
-          const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
-          for (const s of scripts){
+        // helper: robust ISO + epoch regexes
+        const grabFirstIso = (text) => {
+          if (!text) return null;
+          const m = text.match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})/);
+          return m ? m[0] : null;
+        };
+        const grabFirstEpochMs = (text) => {
+          if (!text) return null;
+          const m = text.match(/(?<!\d)(1[6-9]\d{11})(?!\d)/); // 13-digit epoch ms
+          return m ? new Date(Number(m[1])).toISOString() : null;
+        };
+
+        // 3) JSON blobs: __NEXT_DATA__, application/json, application/ld+json
+        if (!startISO) {
+          const scripts = Array.from(document.querySelectorAll('script[type="application/json"], script[type="application/ld+json"], script#__NEXT_DATA__'));
+          for (const s of scripts) {
+            const txt = s.textContent || '';
             try {
-              const json = JSON.parse(s.textContent || 'null');
+              const json = JSON.parse(txt);
               const arr = Array.isArray(json) ? json : [json];
-              for (const obj of arr){
-                if (!obj || typeof obj !== 'object') continue;
-                if ((obj['@type']==='Event' || obj['@type']==='LiveEvent') && obj.startDate){ startISO = obj.startDate; break; }
-                if (obj['@type']==='VideoObject'){
-                  if (obj.publication?.startDate){ startISO = obj.publication.startDate; break; }
-                  if (obj.event?.startDate){ startISO = obj.event.startDate; break; }
-                }
-                if (obj['@graph']){
-                  for (const g of obj['@graph']){
-                    if ((g['@type']==='Event' || g['@type']==='LiveEvent') && g.startDate){ startISO = g.startDate; break; }
+
+              const search = (o, depth=0) => {
+                if (!o || typeof o !== 'object' || depth > 6) return null;
+                for (const [k,v] of Object.entries(o)) {
+                  if (v == null) continue;
+                  if (typeof v === 'string') {
+                    if (/start(date|_date|time|_time)?/i.test(k)) {
+                      const p = Date.parse(v);
+                      if (!Number.isNaN(p)) return v;
+                    }
+                  } else if (typeof v === 'number') {
+                    if (String(v).length === 13 && v > 1e12 && v < 2e12) return new Date(v).toISOString();
+                  } else if (typeof v === 'object') {
+                    const n = search(v, depth+1);
+                    if (n) return n;
                   }
                 }
+                return null;
+              };
+
+              for (const obj of arr) {
+                if ((obj['@type']==='Event' || obj['@type']==='LiveEvent') && obj.startDate) { startISO = obj.startDate; break; }
+                if (obj['@graph']) {
+                  for (const g of obj['@graph']) {
+                    if ((g['@type']==='Event' || g['@type']==='LiveEvent') && g.startDate) { startISO = g.startDate; break; }
+                  }
+                  if (startISO) break;
+                }
+                const found = search(obj, 0);
+                if (found) { startISO = found; break; }
               }
-              if (startISO) break;
-            } catch {}
+            } catch {
+              const iso = grabFirstIso(txt) || grabFirstEpochMs(txt);
+              if (iso) { startISO = iso; }
+            }
+            if (startISO) break;
           }
+        }
+
+        // 4) last resort: scan whole HTML
+        if (!startISO) {
+          const html = document.documentElement.innerHTML || '';
+          startISO = grabFirstIso(html) || grabFirstEpochMs(html);
         }
 
         const fallImg = document.querySelector('img')?.getAttribute('src') || null;
@@ -160,14 +199,17 @@ async function enrich(browser, items, max=50){
 
       const title = (meta.title || it.title || '').trim();
       const thumb = (meta.image || it.thumb || '').trim();
+
       let start = null;
-      if (meta.startISO){
+      if (meta.startISO) {
         const p = Date.parse(meta.startISO);
         if (!Number.isNaN(p)) start = p;
-      } else if (it.start){ start = it.start; }
+      } else if (it.start) {
+        start = it.start;
+      }
 
       out.push({ title, url: it.url, thumb, start });
-    }catch(e){
+    } catch {
       // keep the shallow item if enrichment failed
       out.push({ title: it.title || '', url: it.url, thumb: it.thumb || '', start: it.start || null });
     }
