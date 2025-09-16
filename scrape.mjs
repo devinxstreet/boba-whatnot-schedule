@@ -1,12 +1,15 @@
 import { chromium } from '@playwright/test';
 import fs from 'fs/promises';
 
+/** === CONFIG === */
 const QUERIES = ['Bo Jackson Battle Arena', 'BoBA', 'Bo Battle Arena'];
 const buildSearchUrl = (q) =>
   `https://www.whatnot.com/search?query=${encodeURIComponent(q)}&referringSource=typed&searchVertical=LIVESTREAM`;
 
+/** prefer these phrases in titles (still keeps others if none match) */
 const TITLE_REGEX = /\b(bo\s*jackson\s*battle\s*arena|boba|bo\s*battle\s*arena|tuesday\s*night\s*throwdown)\b/i;
 
+/** === HELPERS === */
 const slug = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 async function ensurePublic() { await fs.mkdir('public', { recursive: true }); }
 
@@ -23,12 +26,17 @@ async function dismissOverlays(page) {
 
 async function autoScroll(page, { step = 700, pause = 220, max = 7000 } = {}) {
   let y = 0;
-  while (y < max) { await page.evaluate(s => window.scrollBy(0, s), step); await page.waitForTimeout(pause); y+=step; }
+  while (y < max) {
+    await page.evaluate(s => window.scrollBy(0, s), step);
+    await page.waitForTimeout(pause);
+    y += step;
+  }
   await page.evaluate(() => window.scrollTo(0, 0));
 }
 
+/** Extract candidate show cards from search page */
 async function extractFromSearch(page) {
-  // grab all live links we can see
+  // grab any link that looks like a livestream card
   const items = await page.evaluate(() => {
     const links = Array.from(document.querySelectorAll('a[href*="/live/"]'));
     const out = links.map(a => {
@@ -41,6 +49,7 @@ async function extractFromSearch(page) {
         a.textContent.trim() || '';
 
       const container = a.closest('article, [data-test*="card"], div, section');
+
       const t = container?.querySelector?.('time[datetime], [data-start-time]');
       const startISO = t?.getAttribute?.('datetime') || t?.getAttribute?.('data-start-time') || null;
 
@@ -63,14 +72,44 @@ async function extractFromSearch(page) {
     return out.filter(i => !seen.has(i.url) && seen.add(i.url));
   });
 
+  // normalize times (may be null)
   return items.map(s => ({ ...s, start: s.startISO ? Date.parse(s.startISO) : null }));
 }
 
+/** Open each show page to enrich title/host/thumbnail/time via OG tags */
 async function enrich(browser, items, max = 30) {
   const ctx = await browser.newContext({
     viewport: { width: 1366, height: 900 },
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128 Safari/537.36',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117 Safari/537.36',
+    locale: 'en-US',
+    timezoneId: 'America/New_York',
   });
+
+  // Anti-bot evasions on every page
+  await ctx.addInitScript(() => {
+    try {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+      Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
+      window.chrome = window.chrome || { runtime: {} };
+      const originalQuery = window.navigator.permissions?.query;
+      if (originalQuery) {
+        window.navigator.permissions.query = (parameters) => (
+          parameters && parameters.name === 'notifications'
+            ? Promise.resolve({ state: Notification.permission })
+            : originalQuery(parameters)
+        );
+      }
+      const gp = WebGLRenderingContext.prototype.getParameter;
+      WebGLRenderingContext.prototype.getParameter = function(param){
+        if (param === 37445) return 'Intel Inc.';              // UNMASKED_VENDOR_WEBGL
+        if (param === 37446) return 'Intel Iris OpenGL Engine';// UNMASKED_RENDERER_WEBGL
+        return gp.call(this, param);
+      };
+      Object.defineProperty(screen, 'availTop', { get: () => 0 });
+    } catch (e) {}
+  });
+
   const page = await ctx.newPage();
   const out = [];
 
@@ -79,6 +118,7 @@ async function enrich(browser, items, max = 30) {
     try {
       await page.goto(it.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
       await page.waitForTimeout(1200);
+      await dismissOverlays(page);
 
       const meta = await page.evaluate(() => {
         const pick = (sel) => document.querySelector(sel)?.getAttribute('content') || null;
@@ -90,7 +130,6 @@ async function enrich(browser, items, max = 30) {
           document.querySelector('a[href*="/user/"]') ||
           document.querySelector('[data-test*="seller"]') ||
           document.querySelector('[data-testid*="seller"]');
-
         const host = hostEl?.textContent?.trim() || null;
 
         const tEl = document.querySelector('time[datetime], [data-start-time]');
@@ -108,51 +147,72 @@ async function enrich(browser, items, max = 30) {
       const start = meta.startISO ? Date.parse(meta.startISO) : it.start || null;
 
       out.push({ title, url: it.url, host, thumb, start });
-    } catch {}
+    } catch (e) {
+      // ignore single-page failures so the run keeps going
+    }
   }
 
   await ctx.close();
   return out;
 }
 
+/** === MAIN === */
 (async () => {
   await ensurePublic();
-  const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'] });
 
-  let all = [];
+  // launch headed (Xvfb will provide display on GitHub Actions)
+  const browser = await chromium.launch({
+    headless: false,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-dev-shm-usage',
+      '--window-size=1366,900',
+      '--lang=en-US,en',
+      '--disable-gpu'
+    ],
+  });
+
+  // one page for all searches (easier artifact writing)
+  const page = await browser.newPage({
+    viewport: { width: 1366, height: 900 },
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117 Safari/537.36',
+  });
+
+  let collected = [];
+
   for (const q of QUERIES) {
     const url = buildSearchUrl(q);
     const s = slug(q);
-
-    const page = await browser.newPage({ viewport: { width: 1366, height: 900 } });
     try {
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
       await page.waitForTimeout(2500);
+      await dismissOverlays(page);
       await autoScroll(page);
 
-      // Debug artifacts
+      // debug artifacts for you to inspect if needed
       await fs.writeFile(`public/debug-${s}.html`, await page.content(), 'utf8').catch(()=>{});
       await page.screenshot({ path: `public/debug-${s}.png`, fullPage: true }).catch(()=>{});
 
       const base = await extractFromSearch(page);
       await fs.writeFile(`public/raw-${s}.json`, JSON.stringify(base, null, 2), 'utf8').catch(()=>{});
 
-      // Prefer our phrases but don't drop everything if none match
+      // prefer titles with your phrases; if none match, keep what we found
       const preferred = base.filter(i => TITLE_REGEX.test((i.title || '').toLowerCase()));
       const chosen = preferred.length ? preferred : base;
 
-      // Enrich details (title/host/thumbnail/time)
+      // enrich (grab real title/host/thumbnail/time)
       const richer = await enrich(browser, chosen, 30);
-      all = all.concat(richer);
+      collected = collected.concat(richer);
     } catch (e) {
       await fs.writeFile(`public/raw-${s}.json`, JSON.stringify({ error: e.message }, null, 2), 'utf8').catch(()=>{});
     }
-    await page.close();
   }
 
-  // Final dedupe + sort upcoming first (undated after)
+  // final dedupe + sort
   const seen = new Set();
-  const final = all.filter(e => {
+  const final = collected.filter(e => {
     const key = `${e.url}|${e.start || 'nostart'}`;
     if (seen.has(key)) return false;
     seen.add(key);
@@ -166,19 +226,22 @@ async function enrich(browser, items, max = 30) {
 
   await fs.writeFile('public/schedule.json', JSON.stringify(final, null, 2), 'utf8');
 
-  // Make the root page helpful while debugging
-  const count = final.length;
-  await fs.writeFile('public/index.html',
+  // simple index to help verify deploy contents
+  await fs.writeFile(
+    'public/index.html',
     `<!doctype html><meta charset="utf-8">
      <body style="background:#0b0b0b;color:#fff;font:16px/1.5 system-ui;padding:24px">
-     <h1>BoBA Schedule (${count} items)</h1>
+     <h1>BoBA Schedule (${final.length} items)</h1>
      <p><a style="color:#ED67A1" href="schedule.json">schedule.json</a></p>
      <ul>
-       ${QUERIES.map(q => `<li><a style="color:#ED67A1" href="debug-${slug(q)}.html">debug ${q}</a> |
-                            <a style="color:#ED67A1" href="raw-${slug(q)}.json">raw ${q}</a> |
-                            <a style="color:#ED67A1" href="debug-${slug(q)}.png">screenshot ${q}</a></li>`).join('')}
+       ${QUERIES.map(q => `<li>
+         <a style="color:#ED67A1" href="debug-${slug(q)}.html">debug ${q}</a> |
+         <a style="color:#ED67A1" href="raw-${slug(q)}.json">raw ${q}</a> |
+         <a style="color:#ED67A1" href="debug-${slug(q)}.png">screenshot ${q}</a>
+       </li>`).join('')}
      </ul>`,
-    'utf8');
+    'utf8'
+  );
 
   await browser.close();
 })();
