@@ -6,7 +6,7 @@ const QUERIES = ['Bo Jackson Battle Arena', 'BoBA', 'Bo Battle Arena'];
 const buildSearchUrl = (q) =>
   `https://www.whatnot.com/search?query=${encodeURIComponent(q)}&referringSource=typed&searchVertical=LIVESTREAM`;
 
-/** prefer these phrases in titles (still keeps others if none match) */
+/** Prefer these phrases in titles (still keeps others if none match) */
 const TITLE_REGEX = /\b(bo\s*jackson\s*battle\s*arena|boba|bo\s*battle\s*arena|tuesday\s*night\s*throwdown)\b/i;
 
 /** === HELPERS === */
@@ -36,7 +36,6 @@ async function autoScroll(page, { step = 700, pause = 220, max = 7000 } = {}) {
 
 /** Extract candidate show cards from search page */
 async function extractFromSearch(page) {
-  // grab any link that looks like a livestream card
   const items = await page.evaluate(() => {
     const links = Array.from(document.querySelectorAll('a[href*="/live/"]'));
     const out = links.map(a => {
@@ -61,18 +60,16 @@ async function extractFromSearch(page) {
       const thumb =
         imgEl?.getAttribute?.('src') ||
         imgEl?.getAttribute?.('data-src') ||
-        imgEl?.getAttribute?.('srcset')?.split(' ')?.[0] ||
+        (imgEl?.getAttribute?.('srcset')?.split(' ')?.[0]) ||
         null;
 
       return { title, url: abs, startISO, host, thumb };
     }).filter(x => x.url);
 
-    // dedupe by URL
     const seen = new Set();
     return out.filter(i => !seen.has(i.url) && seen.add(i.url));
   });
 
-  // normalize times (may be null)
   return items.map(s => ({ ...s, start: s.startISO ? Date.parse(s.startISO) : null }));
 }
 
@@ -174,7 +171,6 @@ async function enrich(browser, items, max = 30) {
     ],
   });
 
-  // one page for all searches (easier artifact writing)
   const page = await browser.newPage({
     viewport: { width: 1366, height: 900 },
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117 Safari/537.36',
@@ -191,7 +187,7 @@ async function enrich(browser, items, max = 30) {
       await dismissOverlays(page);
       await autoScroll(page);
 
-      // debug artifacts for you to inspect if needed
+      // debug artifacts for verification
       await fs.writeFile(`public/debug-${s}.html`, await page.content(), 'utf8').catch(()=>{});
       await page.screenshot({ path: `public/debug-${s}.png`, fullPage: true }).catch(()=>{});
 
@@ -244,4 +240,17 @@ async function enrich(browser, items, max = 30) {
   );
 
   await browser.close();
-})();
+})().catch(async (err) => {
+  // Never crash the process: write an empty feed and log the error
+  console.error('SCRAPER ERROR:', err && err.stack ? err.stack : err);
+  try {
+    await fs.mkdir('public', { recursive: true });
+    await fs.writeFile('public/schedule.json', '[]', 'utf8');
+    await fs.writeFile(
+      'public/index.html',
+      '<!doctype html><meta charset="utf-8"><body style="background:#0b0b0b;color:#fff;font:16px system-ui;padding:24px"><h1>Scraper error</h1><p>See Actions logs for details.</p>',
+      'utf8'
+    );
+  } catch {}
+  // do not rethrow
+});
