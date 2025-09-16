@@ -1,0 +1,11 @@
+{
+  "name": "boba-whatnot-schedule",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "scrape": "node scrape.mjs"
+  },
+  "dependencies": {
+    "@playwright/test": "^1.48.0"
+  }
+}
