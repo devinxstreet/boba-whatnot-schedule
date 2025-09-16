@@ -6,7 +6,6 @@ const QUERIES = ['Bo Jackson Battle Arena', 'BoBA', 'Bo Battle Arena'];
 const buildSearchUrl = (q) =>
   `https://www.whatnot.com/search?query=${encodeURIComponent(q)}&referringSource=typed&searchVertical=LIVESTREAM`;
 
-/** Prefer these phrases in titles (still keeps others if none match) */
 const TITLE_REGEX = /\b(bo\s*jackson\s*battle\s*arena|boba|bo\s*battle\s*arena|tuesday\s*night\s*throwdown)\b/i;
 
 /** === HELPERS === */
@@ -73,7 +72,7 @@ async function extractFromSearch(page) {
   return items.map(s => ({ ...s, start: s.startISO ? Date.parse(s.startISO) : null }));
 }
 
-/** Open each show page to enrich title/host/thumbnail/time via OG tags */
+/** Open each show page and pull title/host/thumb/start time (more robust date extraction) */
 async function enrich(browser, items, max = 30) {
   const ctx = await browser.newContext({
     viewport: { width: 1366, height: 900 },
@@ -82,7 +81,7 @@ async function enrich(browser, items, max = 30) {
     timezoneId: 'America/New_York',
   });
 
-  // Anti-bot evasions on every page
+  // Anti-bot evasions
   await ctx.addInitScript(() => {
     try {
       Object.defineProperty(navigator, 'webdriver', { get: () => false });
@@ -99,8 +98,8 @@ async function enrich(browser, items, max = 30) {
       }
       const gp = WebGLRenderingContext.prototype.getParameter;
       WebGLRenderingContext.prototype.getParameter = function(param){
-        if (param === 37445) return 'Intel Inc.';              // UNMASKED_VENDOR_WEBGL
-        if (param === 37446) return 'Intel Iris OpenGL Engine';// UNMASKED_RENDERER_WEBGL
+        if (param === 37445) return 'Intel Inc.';
+        if (param === 37446) return 'Intel Iris OpenGL Engine';
         return gp.call(this, param);
       };
       Object.defineProperty(screen, 'availTop', { get: () => 0 });
@@ -114,8 +113,7 @@ async function enrich(browser, items, max = 30) {
     const it = items[i];
     try {
       await page.goto(it.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await page.waitForTimeout(1200);
-      await dismissOverlays(page);
+      await page.waitForTimeout(1400);
 
       const meta = await page.evaluate(() => {
         const pick = (sel) => document.querySelector(sel)?.getAttribute('content') || null;
@@ -123,29 +121,89 @@ async function enrich(browser, items, max = 30) {
         const ogImg   = pick('meta[property="og:image"]') || pick('meta[name="og:image"]') || pick('meta[name="twitter:image"]');
         const pageH1  = document.querySelector('h1')?.textContent?.trim() || null;
 
+        // host
         const hostEl =
           document.querySelector('a[href*="/user/"]') ||
           document.querySelector('[data-test*="seller"]') ||
           document.querySelector('[data-testid*="seller"]');
         const host = hostEl?.textContent?.trim() || null;
 
-        const tEl = document.querySelector('time[datetime], [data-start-time]');
-        const startISO = tEl?.getAttribute?.('datetime') || tEl?.getAttribute?.('data-start-time') || null;
+        // --- robust start time hunt ---
+        // 1) explicit elements/attrs
+        let startISO =
+          document.querySelector('time[datetime]')?.getAttribute('datetime') ||
+          document.querySelector('[data-start-time]')?.getAttribute('data-start-time') ||
+          document.querySelector('meta[itemprop="startDate"]')?.getAttribute('content') ||
+          null;
 
+        // 2) JSON-LD blocks (Event/VideoObject with event/startDate)
+        if (!startISO) {
+          const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
+          for (const s of scripts) {
+            try {
+              const json = JSON.parse(s.textContent || 'null');
+              const arr = Array.isArray(json) ? json : [json];
+              for (const obj of arr) {
+                if (!obj || typeof obj !== 'object') continue;
+                // direct Event
+                if ((obj['@type'] === 'Event' || obj['@type'] === 'LiveEvent') && obj.startDate) {
+                  startISO = obj.startDate; break;
+                }
+                // VideoObject with "publication" or "event"
+                if (obj['@type'] === 'VideoObject') {
+                  if (obj.publication && obj.publication.startDate) { startISO = obj.publication.startDate; break; }
+                  if (obj.event && obj.event.startDate) { startISO = obj.event.startDate; break; }
+                }
+                // graph container
+                if (obj['@graph']) {
+                  for (const g of obj['@graph']) {
+                    if ((g['@type'] === 'Event' || g['@type'] === 'LiveEvent') && g.startDate) { startISO = g.startDate; break; }
+                  }
+                }
+              }
+              if (startISO) break;
+            } catch {}
+          }
+        }
+
+        // 3) last resort: scan page text for ISO timestamps
+        if (!startISO) {
+          const isoMatch = (document.documentElement.innerHTML || '').match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(?:\.\d+)?Z/);
+          if (isoMatch) startISO = isoMatch[0];
+        }
+
+        // fallback image in content
         const imgEl = document.querySelector('img');
         const fallImg = imgEl?.getAttribute('src') || imgEl?.getAttribute('data-src') || null;
 
-        return { title: ogTitle || pageH1 || '', image: ogImg || fallImg || '', host: host || '', startISO: startISO || '' };
+        return {
+          title: ogTitle || pageH1 || '',
+          image: ogImg || fallImg || '',
+          host: host || '',
+          startISO: startISO || ''
+        };
       });
 
       const title = (meta.title || it.title || '').trim();
       const host  = (meta.host  || it.host  || '').trim();
       const thumb = (meta.image || it.thumb || '').trim();
-      const start = meta.startISO ? Date.parse(meta.startISO) : it.start || null;
+      // Normalize start
+      let start = null;
+      if (meta.startISO) {
+        const parsed = Date.parse(meta.startISO);
+        if (!Number.isNaN(parsed)) start = parsed;
+      } else if (it.start) {
+        start = it.start;
+      }
+
+      // keep if it matches our phrases OR we found a clear scheduled time
+      if (!TITLE_REGEX.test(title.toLowerCase()) && !start) {
+        continue;
+      }
 
       out.push({ title, url: it.url, host, thumb, start });
     } catch (e) {
-      // ignore single-page failures so the run keeps going
+      // ignore individual failures
     }
   }
 
@@ -157,7 +215,6 @@ async function enrich(browser, items, max = 30) {
 (async () => {
   await ensurePublic();
 
-  // launch headed (Xvfb will provide display on GitHub Actions)
   const browser = await chromium.launch({
     headless: false,
     args: [
@@ -187,18 +244,16 @@ async function enrich(browser, items, max = 30) {
       await dismissOverlays(page);
       await autoScroll(page);
 
-      // debug artifacts for verification
+      // debug artifacts
       await fs.writeFile(`public/debug-${s}.html`, await page.content(), 'utf8').catch(()=>{});
       await page.screenshot({ path: `public/debug-${s}.png`, fullPage: true }).catch(()=>{});
 
       const base = await extractFromSearch(page);
       await fs.writeFile(`public/raw-${s}.json`, JSON.stringify(base, null, 2), 'utf8').catch(()=>{});
 
-      // prefer titles with your phrases; if none match, keep what we found
       const preferred = base.filter(i => TITLE_REGEX.test((i.title || '').toLowerCase()));
       const chosen = preferred.length ? preferred : base;
 
-      // enrich (grab real title/host/thumbnail/time)
       const richer = await enrich(browser, chosen, 30);
       collected = collected.concat(richer);
     } catch (e) {
@@ -222,7 +277,7 @@ async function enrich(browser, items, max = 30) {
 
   await fs.writeFile('public/schedule.json', JSON.stringify(final, null, 2), 'utf8');
 
-  // simple index to help verify deploy contents
+  // simple index to verify deploy contents
   await fs.writeFile(
     'public/index.html',
     `<!doctype html><meta charset="utf-8">
@@ -241,7 +296,6 @@ async function enrich(browser, items, max = 30) {
 
   await browser.close();
 })().catch(async (err) => {
-  // Never crash the process: write an empty feed and log the error
   console.error('SCRAPER ERROR:', err && err.stack ? err.stack : err);
   try {
     await fs.mkdir('public', { recursive: true });
@@ -252,5 +306,4 @@ async function enrich(browser, items, max = 30) {
       'utf8'
     );
   } catch {}
-  // do not rethrow
 });
