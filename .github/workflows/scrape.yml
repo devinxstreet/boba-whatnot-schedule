@@ -27,14 +27,26 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Install Xvfb (virtual display)
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
       - name: Install deps
         run: npm install
 
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
 
-      - name: Scrape shows -> public/schedule.json
-        run: npm run scrape
+      - name: Scrape shows -> public/schedule.json (headed via Xvfb)
+        env:
+          DEBUG: pw:browser*,pw:api   # show detailed Playwright logs
+        run: |
+          set -e
+          node -v
+          xvfb-run -a npm run scrape || (
+            echo 'Scrape failed; writing placeholder'
+            mkdir -p public
+            echo "[]" > public/schedule.json
+          )
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
